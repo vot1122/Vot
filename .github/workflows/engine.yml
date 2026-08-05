@@ -1,0 +1,64 @@
+name: Qwen 14B Secure Assistant
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-bot]
+
+jobs:
+  run-ai:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MY_PAT }}
+          fetch-depth: 0
+
+      - name: Decrypt Memory
+        run: |
+          git config --global user.email "bot@github.com"
+          git config --global user.name "AI Bot"
+          git fetch origin memory || git checkout -b memory
+          if [ -f "webui.db.gpg" ]; then
+            gpg --quiet --batch --yes --decrypt --passphrase="${{ secrets.DB_PASSWORD }}" --output webui.db webui.db.gpg
+          else
+            touch webui.db
+          fi
+          git checkout main
+
+      - name: Install AI Engine
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve & 
+          sleep 10
+          ollama pull qwen2.5:14b-instruct-q4_K_M
+
+      - name: Start Web Portal
+        run: |
+          docker run -d -p 8080:8080 \
+            -v $(pwd)/webui.db:/app/backend/data/webui.db \
+            -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
+            --add-host=host.docker.internal:host-gateway \
+            --name open-webui ghcr.io/open-webui/open-webui:main
+
+      - name: Connect to Ngrok
+        run: |
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt update && sudo apt install ngrok
+          ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
+          ngrok http --domain=${{ secrets.NGROK_DOMAIN }} 8080 &
+
+      - name: Wait & Auto-Sync (5h 20m)
+        run: |
+          sleep 19200
+          sudo docker stop open-webui
+          gpg --quiet --batch --yes --symmetric --passphrase="${{ secrets.DB_PASSWORD }}" --output webui.db.gpg webui.db
+          git checkout memory
+          git add webui.db.gpg
+          git commit -m "Sync memory" || echo "No changes"
+          git push origin memory
+          curl -X POST -H "Authorization: token ${{ secrets.MY_PAT }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/repos/${{ github.repository }}/dispatches \
+          -d '{"event_type": "restart-bot"}'
