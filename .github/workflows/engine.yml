@@ -6,7 +6,7 @@ on:
 
 jobs:
   run-ai:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout & Initial Setup
         uses: actions/checkout@v4
@@ -14,109 +14,205 @@ jobs:
           token: ${{ secrets.MY_PAT }}
           fetch-depth: 0
 
-      - name: "Notification: Startup"
+      - name: Install System Dependencies
         run: |
-          MSG="🚀 AI Workspace Starting! System optimizing..."
-          curl -d "$MSG" ntfy.sh/${{ secrets.NTFY_TOPIC }}
-          curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d text="$MSG"
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 jq curl gpg
 
-      - name: Decrypt & Restore Memory
+      - name: Download & Decrypt Database from GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.MY_PAT }}
         run: |
-          git config --global user.email "bot@github.com"
-          git config --global user.name "AI Bot"
-          git fetch origin memory || git checkout -b memory
-          if [ -f "webui.db.gpg" ]; then
-            gpg --quiet --batch --yes --decrypt --passphrase="${{ secrets.DB_PASSWORD }}" --output webui.db webui.db.gpg
+          echo "Checking GitHub Release 'backup-v1' for existing backup..."
+          
+          # Attempt to download existing backup file from release
+          if gh release download backup-v1 -p "webui.db.gpg" --clobber 2>/dev/null; then
+            echo "Decrypting webui.db.gpg..."
+            gpg --quiet --batch --yes --decrypt \
+              --passphrase="${{ secrets.DB_PASSWORD }}" \
+              --output webui.db webui.db.gpg
+            rm -f webui.db.gpg
+          else
+            echo "No existing release backup found."
           fi
-          git checkout main
+
+          # Create empty DB if not present
+          if [ ! -f "webui.db" ]; then
+            echo "Creating blank SQLite DB..."
+            sqlite3 webui.db "VACUUM;"
+          fi
+
+          # Integrity Check
+          if ! sqlite3 webui.db "PRAGMA quick_check;" | grep -q "ok"; then
+            echo "❌ Database verification failed! File is corrupted or invalid."
+            exit 1
+          fi
+          
+          echo "✅ Database verified and ready."
 
       - name: Launch AI Engine & Monitor
         run: |
+          send_tele_with_retry() {
+            local payload="$1"
+            local endpoint="${2:-sendMessage}"
+            local max_attempts=5
+            local attempt=1
+            local timeout=2
+
+            while [ $attempt -le $max_attempts ]; do
+              if curl -s -f -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/$endpoint" $payload > /dev/null; then
+                return 0
+              fi
+              echo "Telegram send failed (Attempt $attempt/$max_attempts). Retrying in ${timeout}s..."
+              sleep $timeout
+              attempt=$((attempt + 1))
+              timeout=$((timeout * 2))
+            done
+            echo "⚠️ Failed to send Telegram notification after $max_attempts attempts."
+            return 1
+          }
+
           cleanup() {
             EXIT_CODE=$?
-            if [ $EXIT_CODE -eq 0 ]; then REASON="✅ Scheduled Handover Complete.";
-            elif [ $EXIT_CODE -eq 137 ]; then REASON="🚨 CRASH: Out of Memory (OOM)!";
-            elif [ $EXIT_CODE -eq 143 ] || [ $EXIT_CODE -eq 130 ]; then REASON="🛑 STOPPED: Manually cancelled by user.";
+            if [ $EXIT_CODE -eq 0 ]; then
+              REASON="✅ Scheduled Handover Complete."
+            elif [ $EXIT_CODE -eq 137 ]; then
+              REASON="🚨 CRASH: Out of Memory (OOM)!"
+            elif [ $EXIT_CODE -eq 143 ] || [ $EXIT_CODE -eq 130 ]; then
+              REASON="🛑 STOPPED: Manually cancelled by user."
             else 
               docker logs open-webui 2>&1 | tail -n 50 > crash_logs.txt
-              REASON="❌ CRASH: System error (Code: $EXIT_CODE). Check the attached logs."
-              curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument -F chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -F document=@crash_logs.txt -F caption="$REASON"
+              REASON="❌ CRASH: System error (Code: $EXIT_CODE)."
+              send_tele_with_retry "-F chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -F document=@crash_logs.txt -F caption=\"$REASON\"" "sendDocument"
             fi
-            curl -d "$REASON" ntfy.sh/${{ secrets.NTFY_TOPIC }}
+            curl -s -d "$REASON" "ntfy.sh/${{ secrets.NTFY_TOPIC }}" || true
           }
           trap cleanup EXIT
 
+          START_MSG="🚀 AI Workspace Starting! System initializing..."
+          curl -s -d "$START_MSG" "ntfy.sh/${{ secrets.NTFY_TOPIC }}" || true
+          send_tele_with_retry "-d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d text=\"$START_MSG\""
+
+          # Free up disk space
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+
+          # Install and Start Ollama
           curl -fsSL https://ollama.com/install.sh | sh
           export OLLAMA_HOST=0.0.0.0
-          ollama serve & 
-          sleep 10
+          ollama serve &
+          OLLAMA_PID=$!
+
+          # Readiness Check: Ollama
+          echo "Waiting for Ollama service..."
+          until curl -s http://localhost:11434/api/tags > /dev/null; do
+            sleep 2
+          done
+          echo "✅ Ollama is ready."
+
           ollama pull qwen2.5:14b-instruct-q4_K_M
 
+          # Start Open WebUI Container
           docker run -d -p 8080:8080 \
             -v $(pwd)/webui.db:/app/backend/data/webui.db \
             -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
             -e WEBUI_SECRET_KEY=${{ secrets.WEBUI_SECRET_KEY }} \
             --add-host=host.docker.internal:host-gateway \
             --name open-webui ghcr.io/open-webui/open-webui:main
-          
-          # LIVE DOWNLOAD MONITOR (Updated for 10-minute window)
-          echo "Starting Live Download Monitor..."
-          (
-            for i in {1..15}; do
-              sleep 60
-              if docker logs open-webui 2>&1 | grep -q "Fetching"; then
-                PROGRESS=$(docker logs open-webui 2>&1 | grep "Fetching" | tail -n 1)
-                curl -d "⏳ Still downloading components: $PROGRESS" ntfy.sh/${{ secrets.NTFY_TOPIC }}
-              fi
-            done
-          ) &
 
-          # UPDATED: 10-minute initialization period
-          echo "Waiting 10 minutes for AI components to initialize..."
-          sleep 600
-          
+          # Readiness Check: Open WebUI
+          echo "Waiting for Open WebUI container..."
+          until curl -s -f http://localhost:8080/health > /dev/null || curl -s -f http://localhost:8080/ > /dev/null; do
+            sleep 5
+          done
+          echo "✅ Open WebUI is ready."
+
+          # Inject UI Timer Script
           docker exec open-webui bash -c "echo '<script>setInterval(function(){let r=Math.max(0,19200000-(new Date().getTime()-(window.s||(window.s=new Date().getTime())))),m=Math.floor(r/60000),s=Math.floor(r%60000/1000),d=document.getElementById(\"rt\");d||((d=document.createElement(\"div\")).id=\"rt\",d.style=\"position:fixed;top:10px;right:10px;z-index:9999;padding:8px;background:rgba(0,0,0,0.8);color:white;border-radius:4px;font:12px monospace;\",document.body.appendChild(d)),d.innerHTML=\"RESTART: \"+m+\"m \"+s+\"s\",m<10&&(d.style.background=\"red\")},1000)</script>' >> /app/build/index.html" || echo "Timer injection skipped"
-          
+
+          # Setup Ngrok Tunnel
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/trusted.gpg.d/ngrok.list
           sudo apt update && sudo apt install ngrok -y
           ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
           ngrok http --url=${{ secrets.NGROK_DOMAIN }} 8080 &
+          NGROK_PID=$!
 
-          until curl -s -f http://localhost:8080 > /dev/null; do sleep 10; done
           READY_MSG="✅ AI Portal ONLINE: https://${{ secrets.NGROK_DOMAIN }}"
-          curl -d "$READY_MSG" ntfy.sh/${{ secrets.NTFY_TOPIC }}
-          curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d text="$READY_MSG"
+          curl -s -d "$READY_MSG" "ntfy.sh/${{ secrets.NTFY_TOPIC }}" || true
+          send_tele_with_retry "-d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d text=\"$READY_MSG\""
 
-          # ACTIVITY MONITOR
+          # Background Task 1: Activity Monitor
           (
-            docker logs -f open-webui 2>&1 | while read L; do
+            docker logs -f open-webui 2>&1 | while read -r L; do
               if echo "$L" | grep -q "Login successful"; then
                 IP=$(echo "$L" | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b" | head -1)
-                curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d text="🔐 Login: $IP"
+                send_tele_with_retry "-d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d text=\"🔐 Login: $IP\""
               elif echo "$L" | grep -q "User message"; then
                 MSG=$(echo "$L" | sed 's/.*User message: //')
-                curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d text="💬 User: $MSG"
+                send_tele_with_retry "-d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d text=\"💬 User: $MSG\""
               elif echo "$L" | grep -q "Assistant response"; then
                 echo "$L" | sed 's/.*Assistant response: //' > ai_reply.txt
-                curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument -F chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -F document=@ai_reply.txt -F caption="🤖 AI Response"
+                send_tele_with_retry "-F chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -F document=@ai_reply.txt -F caption=\"🤖 AI Response\"" "sendDocument"
               elif echo "$L" | grep -q "File upload"; then
-                curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d text="📎 File Uploaded"
+                send_tele_with_retry "-d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d text=\"📎 File Uploaded\""
               fi
             done
           ) &
+          MONITOR_PID=$!
 
+          # Background Task 2: GitHub Release Sync Loop
           (
+            export GH_TOKEN="${{ secrets.MY_PAT }}"
+
+            # Ensure the release exists
+            gh release create backup-v1 --title "Database Backups" --notes "Automated SQLite storage" 2>/dev/null || true
+
             while true; do
               sleep 300
-              gpg --quiet --batch --yes --symmetric --passphrase=\"${{ secrets.DB_PASSWORD }}\" --output webui.db.gpg webui.db
-              git checkout memory && git add webui.db.gpg && git commit -m \"Sync\" && git push origin memory || echo \"No change\"
-              git checkout main
+              
+              # Safe SQLite snapshot export
+              sqlite3 webui.db ".backup 'webui_backup.db'"
+              
+              # Encrypt backup copy
+              gpg --quiet --batch --yes --symmetric \
+                --passphrase="${{ secrets.DB_PASSWORD }}" \
+                --output webui_backup.db.gpg webui_backup.db
+              
+              rm -f webui_backup.db
+
+              # Upload/overwrite asset in GitHub Release
+              gh release upload backup-v1 webui_backup.db.gpg#webui.db.gpg --clobber || echo "Release upload failed, retrying next cycle"
+              
+              rm -f webui_backup.db.gpg
             done
           ) &
+          SYNC_PID=$!
 
-          sleep 18600
-          curl -d "⚠️ 10 MINUTE WARNING!" ntfy.sh/${{ secrets.NTFY_TOPIC }}
+          # Execution Runtime: 5 Hours (18000s) + 10 Min Warning (600s)
+          sleep 18000
+          WARN_MSG="⚠️ 10 MINUTE WARNING: Scheduled restart approaching!"
+          curl -s -d "$WARN_MSG" "ntfy.sh/${{ secrets.NTFY_TOPIC }}" || true
+          send_tele_with_retry "-d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d text=\"$WARN_MSG\""
+          
           sleep 600
-          curl -X POST -H \"Authorization: token ${{ secrets.MY_PAT }}\" -H \"Accept: application/vnd.github.v3+json\" https://api.github.com/repos/${{ github.repository }}/dispatches -d '{\"event_type\": \"restart-bot\"}'
+
+          # Clean Up Background Processes
+          kill $SYNC_PID $MONITOR_PID $NGROK_PID $OLLAMA_PID || true
+
+          # Self-Handoff Dispatch
+          echo "Dispatching restart event..."
+          for i in {1..5}; do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X POST \
+              -H "Authorization: token ${{ secrets.MY_PAT }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/dispatches \
+              -d '{"event_type": "restart-bot"}')
+            
+            if [ "$HTTP_STATUS" -eq 204 ]; then
+              echo "✅ Repository dispatch trigger sent successfully."
+              break
+            fi
+            echo "Dispatch failed with status $HTTP_STATUS. Retrying in 5s..."
+            sleep 5
+          done
