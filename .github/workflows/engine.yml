@@ -27,23 +27,19 @@ jobs:
           git fetch origin memory || git checkout -b memory
           if [ -f "webui.db.gpg" ]; then
             gpg --quiet --batch --yes --decrypt --passphrase="${{ secrets.DB_PASSWORD }}" --output webui.db webui.db.gpg
-          else
-            touch webui.db
           fi
           git checkout main
 
       - name: Launch AI Engine & Monitor
         run: |
-          # Advanced Cleanup with 50-line Log Capture
           cleanup() {
             EXIT_CODE=$?
             if [ $EXIT_CODE -eq 0 ]; then REASON="✅ Scheduled Handover Complete.";
             elif [ $EXIT_CODE -eq 137 ]; then REASON="🚨 CRASH: Out of Memory (OOM)!";
             elif [ $EXIT_CODE -eq 143 ] || [ $EXIT_CODE -eq 130 ]; then REASON="🛑 STOPPED: Manually cancelled by user.";
             else 
-              # Capture last 50 lines for deep debugging
               docker logs open-webui 2>&1 | tail -n 50 > crash_logs.txt
-              REASON="❌ CRASH: System error (Code: $EXIT_CODE). Check the attached logs for details."
+              REASON="❌ CRASH: System error (Code: $EXIT_CODE). Check the attached logs."
               curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument -F chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -F document=@crash_logs.txt -F caption="$REASON"
             fi
             curl -d "$REASON" ntfy.sh/${{ secrets.NTFY_TOPIC }}
@@ -64,16 +60,23 @@ jobs:
             --add-host=host.docker.internal:host-gateway \
             --name open-webui ghcr.io/open-webui/open-webui:main
           
-          # Feature: 2-Minute Grace Period & Healthy Check
-          echo "Waiting 2 minutes for Web UI to stabilize..."
-          sleep 120
+          # LIVE DOWNLOAD MONITOR (Updated for 10-minute window)
+          echo "Starting Live Download Monitor..."
+          (
+            for i in {1..15}; do
+              sleep 60
+              if docker logs open-webui 2>&1 | grep -q "Fetching"; then
+                PROGRESS=$(docker logs open-webui 2>&1 | grep "Fetching" | tail -n 1)
+                curl -d "⏳ Still downloading components: $PROGRESS" ntfy.sh/${{ secrets.NTFY_TOPIC }}
+              fi
+            done
+          ) &
+
+          # UPDATED: 10-minute initialization period
+          echo "Waiting 10 minutes for AI components to initialize..."
+          sleep 600
           
-          if docker ps | grep -q open-webui; then
-            docker exec open-webui bash -c "echo '<script>setInterval(function(){let r=Math.max(0,19200000-(new Date().getTime()-(window.s||(window.s=new Date().getTime())))),m=Math.floor(r/60000),s=Math.floor(r%60000/1000),d=document.getElementById(\"rt\");d||((d=document.createElement(\"div\")).id=\"rt\",d.style=\"position:fixed;top:10px;right:10px;z-index:9999;padding:8px;background:rgba(0,0,0,0.8);color:white;border-radius:4px;font:12px monospace;\",document.body.appendChild(d)),d.innerHTML=\"RESTART: \"+m+\"m \"+s+\"s\",m<10&&(d.style.background=\"red\")},1000)</script>' >> /app/build/index.html"
-          else
-            echo "Web UI failed to start. Triggering exit."
-            exit 1
-          fi
+          docker exec open-webui bash -c "echo '<script>setInterval(function(){let r=Math.max(0,19200000-(new Date().getTime()-(window.s||(window.s=new Date().getTime())))),m=Math.floor(r/60000),s=Math.floor(r%60000/1000),d=document.getElementById(\"rt\");d||((d=document.createElement(\"div\")).id=\"rt\",d.style=\"position:fixed;top:10px;right:10px;z-index:9999;padding:8px;background:rgba(0,0,0,0.8);color:white;border-radius:4px;font:12px monospace;\",document.body.appendChild(d)),d.innerHTML=\"RESTART: \"+m+\"m \"+s+\"s\",m<10&&(d.style.background=\"red\")},1000)</script>' >> /app/build/index.html" || echo "Timer injection skipped"
           
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/trusted.gpg.d/ngrok.list
@@ -81,11 +84,12 @@ jobs:
           ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
           ngrok http --url=${{ secrets.NGROK_DOMAIN }} 8080 &
 
-          until curl -s -f http://localhost:8080 > /dev/null; do sleep 5; done
+          until curl -s -f http://localhost:8080 > /dev/null; do sleep 10; done
           READY_MSG="✅ AI Portal ONLINE: https://${{ secrets.NGROK_DOMAIN }}"
           curl -d "$READY_MSG" ntfy.sh/${{ secrets.NTFY_TOPIC }}
           curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d text="$READY_MSG"
 
+          # ACTIVITY MONITOR
           (
             docker logs -f open-webui 2>&1 | while read L; do
               if echo "$L" | grep -q "Login successful"; then
@@ -106,8 +110,8 @@ jobs:
           (
             while true; do
               sleep 300
-              gpg --quiet --batch --yes --symmetric --passphrase="${{ secrets.DB_PASSWORD }}" --output webui.db.gpg webui.db
-              git checkout memory && git add webui.db.gpg && git commit -m "Sync" && git push origin memory || echo "No change"
+              gpg --quiet --batch --yes --symmetric --passphrase=\"${{ secrets.DB_PASSWORD }}\" --output webui.db.gpg webui.db
+              git checkout memory && git add webui.db.gpg && git commit -m \"Sync\" && git push origin memory || echo \"No change\"
               git checkout main
             done
           ) &
@@ -115,4 +119,4 @@ jobs:
           sleep 18600
           curl -d "⚠️ 10 MINUTE WARNING!" ntfy.sh/${{ secrets.NTFY_TOPIC }}
           sleep 600
-          curl -X POST -H "Authorization: token ${{ secrets.MY_PAT }}" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/${{ github.repository }}/dispatches -d '{"event_type": "restart-bot"}'
+          curl -X POST -H \"Authorization: token ${{ secrets.MY_PAT }}\" -H \"Accept: application/vnd.github.v3+json\" https://api.github.com/repos/${{ github.repository }}/dispatches -d '{\"event_type\": \"restart-bot\"}'
