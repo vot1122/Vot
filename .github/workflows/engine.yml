@@ -29,12 +29,15 @@ jobs:
       - name: Install AI Engine
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
+          # This line allows the WebUI to talk to Ollama
+          export OLLAMA_HOST=0.0.0.0
           ollama serve & 
-          sleep 10
+          sleep 15
           ollama pull qwen2.5:14b-instruct-q4_K_M
 
       - name: Start Web Portal
         run: |
+          # We use the host's IP to ensure Docker can reach Ollama
           docker run -d -p 8080:8080 \
             -v $(pwd)/webui.db:/app/backend/data/webui.db \
             -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
@@ -47,17 +50,20 @@ jobs:
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt update && sudo apt install ngrok
           ngrok config add-authtoken ${{ secrets.NGROK_TOKEN }}
-          ngrok http --domain=${{ secrets.NGROK_DOMAIN }} 8080 &
+          # Using the updated --url command
+          ngrok http --url=${{ secrets.NGROK_DOMAIN }} 8080 &
 
       - name: Wait & Auto-Sync (5h 20m)
         run: |
+          echo "AI is live! Waiting 5h 20m before syncing memory and restarting..."
           sleep 19200
           sudo docker stop open-webui
           gpg --quiet --batch --yes --symmetric --passphrase="${{ secrets.DB_PASSWORD }}" --output webui.db.gpg webui.db
           git checkout memory
           git add webui.db.gpg
-          git commit -m "Sync memory" || echo "No changes"
+          git commit -m "Sync encrypted memory" || echo "No changes"
           git push origin memory
+          # Trigger the next run
           curl -X POST -H "Authorization: token ${{ secrets.MY_PAT }}" \
           -H "Accept: application/vnd.github.v3+json" \
           https://api.github.com/repos/${{ github.repository }}/dispatches \
