@@ -53,7 +53,7 @@ jobs:
         run: |
           save_memory() {
             echo "💾 Saving current database memory..."
-            docker run --rm -v open-webui-data:/data -v $(pwd):/backup ubuntu cp /data/webui.db /backup/webui.db 2>/dev/null || true
+            docker run --rm -v open-webui-data:/app/backend/data -v $(pwd):/backup ubuntu cp /app/backend/data/webui.db /backup/webui.db 2>/dev/null || true
             if [ -f "webui.db" ]; then
               rm -f webui.db.gpg
               gpg --quiet --batch --yes --symmetric --passphrase="${DB_PASSWORD}" --output webui.db.gpg webui.db
@@ -91,7 +91,6 @@ jobs:
           sudo systemctl stop ollama || true
           sudo systemctl disable ollama || true
 
-          # SPEED OPTIMIZATION ENVIRONMENT VARIABLES
           export OLLAMA_HOST=0.0.0.0:11434
           export OLLAMA_NUM_PARALLEL=1
           export OLLAMA_MAX_LOADED_MODELS=1
@@ -110,16 +109,17 @@ jobs:
           echo "Pulling AI Model $MODEL..."
           ollama pull $MODEL
 
-          # Preload model into RAM immediately so first token response is fast
           echo "Preloading model into system memory..."
           curl -s http://127.0.0.1:11434/api/generate -d "{\"model\": \"$MODEL\"}" > /dev/null
           echo "✅ Model $MODEL ready."
 
           uvicorn logger_proxy:app --host 0.0.0.0 --port 11435 &
 
+          # CREATE VOLUME & RESTORE DATABASE TO CORRECT CONTAINER PATH
           docker volume create open-webui-data
           if [ -f "webui.db" ]; then
-            docker run --rm -v open-webui-data:/data -v $(pwd):/backup ubuntu cp /backup/webui.db /data/webui.db
+            echo "Restoring existing database to Open WebUI..."
+            docker run --rm -v open-webui-data:/app/backend/data -v $(pwd):/backup ubuntu cp /backup/webui.db /app/backend/data/webui.db
           fi
 
           EXPIRE_AT=$(($(date +%s) + 19200))
@@ -130,6 +130,7 @@ jobs:
             -e OLLAMA_BASE_URL=http://127.0.0.1:11435 \
             -e WEBUI_SECRET_KEY="${SECRET_KEY_VAL}" \
             -e ENABLE_OLLAMA_API=True \
+            -e DEFAULT_MODELS="${MODEL}" \
             --name open-webui \
             --restart unless-stopped \
             ghcr.io/open-webui/open-webui:main
@@ -168,7 +169,7 @@ jobs:
                 -d "chat_id=${TELEGRAM_CHAT_ID}" \
                 -d "text=$METRICS"
 
-              docker run --rm -v open-webui-data:/data -v $(pwd):/backup ubuntu cp /data/webui.db /backup/webui.db 2>/dev/null || true
+              docker run --rm -v open-webui-data:/app/backend/data -v $(pwd):/backup ubuntu cp /app/backend/data/webui.db /backup/webui.db 2>/dev/null || true
               rm -f webui.db.gpg
               gpg --quiet --batch --yes --symmetric --passphrase="${DB_PASSWORD}" --output webui.db.gpg webui.db
               
