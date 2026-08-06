@@ -9,16 +9,16 @@ jobs:
   run-ai:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout & Initial Setup
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.MY_PAT }}
           fetch-depth: 0
 
-      - name: "Notification: Startup"
+      - name: Send Startup Notification
         run: |
           MSG="🚀 AI Workspace Starting..."
-          curl -d "$MSG" "ntfy.sh/${{ secrets.NTFY_TOPIC }}"
+          curl -s -d "$MSG" "ntfy.sh/${{ secrets.NTFY_TOPIC }}"
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" -d "text=$MSG"
 
       - name: Setup Python Environment
@@ -26,10 +26,10 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Logging Proxy Dependencies
+      - name: Install Python Dependencies
         run: pip install fastapi uvicorn requests
 
-      - name: Decrypt & Restore Memory
+      - name: Decrypt and Restore Database Memory
         run: |
           git config --global user.email "bot@github.com"
           git config --global user.name "AI Bot"
@@ -40,7 +40,16 @@ jobs:
           fi
           git checkout main
 
-      - name: Launch AI Engine & Services
+      - name: Launch AI Engine Services
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WEBUI_SECRET_KEY: ${{ secrets.WEBUI_SECRET_KEY }}
+          NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
+          NGROK_DOMAIN: ${{ secrets.NGROK_DOMAIN }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          MY_PAT: ${{ secrets.MY_PAT }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
           cleanup() {
             EXIT_CODE=$?
@@ -49,10 +58,10 @@ jobs:
             elif [ $EXIT_CODE -eq 143 ] || [ $EXIT_CODE -eq 130 ]; then REASON="🛑 STOPPED: Manually cancelled by user.";
             else 
               docker logs open-webui 2>&1 | tail -n 100 > crash_logs.txt
-              REASON="❌ CRASH: System error (Code: $EXIT_CODE). Logs attached."
-              curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument" -F "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" -F "document=@crash_logs.txt" -F "caption=$REASON"
+              REASON="❌ CRASH: System error (Code: $EXIT_CODE)."
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" -F "chat_id=${TELEGRAM_CHAT_ID}" -F "document=@crash_logs.txt" -F "caption=$REASON"
             fi
-            curl -d "$REASON" "ntfy.sh/${{ secrets.NTFY_TOPIC }}"
+            curl -s -d "$REASON" "ntfy.sh/${NTFY_TOPIC}"
           }
           trap cleanup EXIT
 
@@ -83,75 +92,6 @@ jobs:
           ollama pull $MODEL | while read -r line; do echo "[OLLAMA PULL] $line"; done
           echo "✅ Model $MODEL downloaded successfully."
 
-          cat << 'EOF' > logger_proxy.py
-import json
-import datetime
-import requests
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
-
-app = FastAPI()
-OLLAMA_URL = "http://127.0.0.1:11434"
-TELEGRAM_BOT_TOKEN = "${{ secrets.TELEGRAM_BOT_TOKEN }}"
-TELEGRAM_CHAT_ID = "${{ secrets.TELEGRAM_CHAT_ID }}"
-
-def send_to_telegram(filename, content):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-        files = {"document": (filename, content.encode('utf-8'))}
-        data = {"chat_id": TELEGRAM_CHAT_ID, "caption": f"📄 Chat Log: {filename}"}
-        requests.post(url, data=data, files=files, timeout=10)
-    except Exception as e:
-        print(f"Telegram upload failed: {e}")
-
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
-async def proxy(request: Request, path: str):
-    body = await request.body()
-    headers = dict(request.headers)
-    headers.pop("host", None)
-    url = f"{OLLAMA_URL}/{path}"
-
-    if path in ["api/chat", "api/generate"] and request.method == "POST":
-        try:
-            payload = json.loads(body.decode("utf-8"))
-            user_prompt = ""
-            if "messages" in payload:
-                user_prompt = payload["messages"][-1].get("content", "")
-            elif "prompt" in payload:
-                user_prompt = payload.get("prompt", "")
-
-            res = requests.post(url, data=body, headers=headers, stream=True)
-
-            def stream_processor():
-                full_response = ""
-                for chunk in res.iter_content(chunk_size=1024):
-                    if chunk:
-                        yield chunk
-                        try:
-                            lines = chunk.decode("utf-8", errors="ignore").strip().split("\n")
-                            for line in lines:
-                                if line:
-                                    data = json.loads(line)
-                                    if "message" in data:
-                                        full_response += data["message"].get("content", "")
-                                    elif "response" in data:
-                                        full_response += data.get("response", "")
-                        except Exception:
-                            pass
-
-                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                log_filename = f"chat_{timestamp}.txt"
-                log_content = f"--- USER PROMPT ---\n{user_prompt}\n\n--- AI RESPONSE ---\n{full_response}"
-                send_to_telegram(log_filename, log_content)
-
-            return StreamingResponse(stream_processor(), media_type=res.headers.get("content-type"))
-        except Exception as e:
-            print(f"Proxy error: {e}")
-
-    res = requests.request(method=request.method, url=url, headers=headers, data=body if body else None, stream=True)
-    return StreamingResponse(res.iter_content(chunk_size=1024), status_code=res.status_code)
-EOF
-
           uvicorn logger_proxy:app --host 0.0.0.0 --port 11435 &
 
           docker volume create open-webui-data
@@ -159,67 +99,32 @@ EOF
             docker run --rm -v open-webui-data:/data -v $(pwd):/backup ubuntu cp /backup/webui.db /data/webui.db
           fi
 
-          # 1. CALCULATE FIXED SERVER EXPIRATION TIMESTAMP (Epoch Time in Seconds)
-          # 19200 seconds = 5 hours 20 minutes from the exact second this step executes
           EXPIRE_AT=$(($(date +%s) + 19200))
 
           docker run -d --net=host \
             -v open-webui-data:/app/backend/data \
             -e OLLAMA_BASE_URL=http://127.0.0.1:11435 \
-            -e WEBUI_SECRET_KEY="${{ secrets.WEBUI_SECRET_KEY }}" \
+            -e WEBUI_SECRET_KEY="${WEBUI_SECRET_KEY}" \
             --name open-webui \
             --restart unless-stopped \
             ghcr.io/open-webui/open-webui:main
 
           sleep 8
 
-          # 2. INJECT FIXED TIMESTAMP SCRIPT INTO HTML
-          # This writes the static $EXPIRE_AT value directly into index.html inside the container
-          docker exec open-webui bash -c "cat << 'COUNTDOWN_SCRIPT' >> /app/build/index.html
-<script>
-  (function() {
-    // Fixed Server Expiration Epoch (Hardcoded at launch)
-    const serverTargetEpoch = ${EXPIRE_AT} * 1000;
-
-    const badge = document.createElement('div');
-    badge.id = 'session-countdown-badge';
-    badge.style.cssText = 'position: fixed; top: 12px; right: 80px; z-index: 999999; background: rgba(30, 30, 30, 0.75); color: #e5e7eb; backdrop-filter: blur(8px); padding: 4px 12px; border-radius: 9999px; font-size: 11px; font-weight: 600; font-family: monospace; border: 1px solid rgba(255, 255, 255, 0.15); box-shadow: 0 2px 6px rgba(0,0,0,0.3); pointer-events: none; display: flex; align-items: center; gap: 4px;';
-    document.body.appendChild(badge);
-
-    function syncCountdown() {
-      const currentEpoch = Date.now();
-      const remainingSeconds = Math.max(0, Math.floor((serverTargetEpoch - currentEpoch) / 1000));
-      
-      const hours = Math.floor(remainingSeconds / 3600);
-      const minutes = Math.floor((remainingSeconds % 3600) / 60);
-      const seconds = remainingSeconds % 60;
-
-      badge.textContent = 'Time: ' + hours + 'h ' + String(minutes).padStart(2, '0') + 'm ' + String(seconds).padStart(2, '0') + 's';
-
-      if (remainingSeconds <= 600) {
-        badge.style.color = '#f87171';
-        badge.style.borderColor = 'rgba(239, 68, 68, 0.4)';
-      }
-    }
-
-    syncCountdown();
-    setInterval(syncCountdown, 1000);
-  })();
-</script>
-COUNTDOWN_SCRIPT"
+          docker exec open-webui bash -c "echo '<script>(function(){const target=${EXPIRE_AT}*1000;const b=document.createElement(\"div\");b.style.cssText=\"position:fixed;top:12px;right:80px;z-index:999999;background:rgba(30,30,30,0.75);color:#e5e7eb;backdrop-filter:blur(8px);padding:4px 12px;border-radius:9999px;font-size:11px;font-weight:600;font-family:monospace;border:1px solid rgba(255,255,255,0.15);pointer-events:none;\";document.body.appendChild(b);function u(){const r=Math.max(0,Math.floor((target-Date.now())/1000));const h=Math.floor(r/3600);const m=Math.floor((r%3600)/60);const s=r%60;b.textContent=\"Time: \"+h+\"h \"+String(m).padStart(2,\"0\")+\"m \"+String(s).padStart(2,\"0\")+\"s\";if(r<=600){b.style.color=\"#f87171\";}}u();setInterval(u,1000);})();</script>' >> /app/build/index.html"
 
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt update && sudo apt install ngrok -y
-          ngrok config add-authtoken "${{ secrets.NGROK_TOKEN }}"
-          DOMAIN=$(echo "${{ secrets.NGROK_DOMAIN }}" | sed 's|https://||g' | sed 's|http://||g')
+          ngrok config add-authtoken "${NGROK_TOKEN}"
+          DOMAIN=$(echo "${NGROK_DOMAIN}" | sed 's|https://||g' | sed 's|http://||g')
           ngrok http --url=$DOMAIN 8080 &
 
           until curl -s -f http://127.0.0.1:8080 > /dev/null; do sleep 5; done
 
           READY_MSG="✅ AI Portal ONLINE: https://$DOMAIN"
-          curl -d "$READY_MSG" "ntfy.sh/${{ secrets.NTFY_TOPIC }}"
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" -d "text=$READY_MSG"
+          curl -s -d "$READY_MSG" "ntfy.sh/${NTFY_TOPIC}"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d "chat_id=${TELEGRAM_CHAT_ID}" -d "text=$READY_MSG"
 
           (
             while true; do
@@ -236,13 +141,13 @@ COUNTDOWN_SCRIPT"
           Ollama: $OLLAMA_STATUS
           WebUI: Healthy"
 
-              curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-                -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -d "chat_id=${TELEGRAM_CHAT_ID}" \
                 -d "text=$METRICS"
 
               docker run --rm -v open-webui-data:/data -v $(pwd):/backup ubuntu cp /data/webui.db /backup/webui.db
               rm -f webui.db.gpg
-              gpg --quiet --batch --yes --symmetric --passphrase="${{ secrets.DB_PASSWORD }}" --output webui.db.gpg webui.db
+              gpg --quiet --batch --yes --symmetric --passphrase="${DB_PASSWORD}" --output webui.db.gpg webui.db
               
               git fetch origin memory
               git checkout memory
@@ -254,15 +159,14 @@ COUNTDOWN_SCRIPT"
           ) &
 
           sleep 18600
-          curl -d "⚠️ 10 MINUTE WARNING: Scheduled Handover Imminent" "ntfy.sh/${{ secrets.NTFY_TOPIC }}"
+          curl -s -d "⚠️ 10 MINUTE WARNING: Scheduled Handover Imminent" "ntfy.sh/${NTFY_TOPIC}"
           sleep 600
           
           docker run --rm -v open-webui-data:/data -v $(pwd):/backup ubuntu cp /data/webui.db /backup/webui.db
-          gpg --quiet --batch --yes --symmetric --passphrase="${{ secrets.DB_PASSWORD }}" --output webui.db.gpg webui.db
+          gpg --quiet --batch --yes --symmetric --passphrase="${DB_PASSWORD}" --output webui.db.gpg webui.db
           git checkout memory && git add webui.db.gpg && git commit -m "Final Handover Sync" && git push origin memory || true
           
-          curl -X POST -H "Authorization: token ${{ secrets.MY_PAT }}" \
+          curl -X POST -H "Authorization: token ${MY_PAT}" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${{ github.repository }}/dispatches" \
             -d '{"event_type": "restart-bot"}'
-            
