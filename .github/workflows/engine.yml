@@ -33,10 +33,11 @@ jobs:
         run: |
           git config --global user.email "bot@github.com"
           git config --global user.name "AI Bot"
-          rm -f webui.db webui.db.gpg
+          rm -f webui_db.tar.gz webui.db webui.db-wal webui.db-shm webui.db.gpg
           git fetch origin memory || git checkout -b memory
           if [ -f "webui.db.gpg" ]; then
-            gpg --quiet --batch --yes --decrypt --passphrase="${{ secrets.DB_PASSWORD }}" --output webui.db webui.db.gpg
+            gpg --quiet --batch --yes --decrypt --passphrase="${{ secrets.DB_PASSWORD }}" --output webui_db.tar.gz webui.db.gpg
+            tar -xzf webui_db.tar.gz || echo "No active WAL files to extract."
           fi
           git checkout main
 
@@ -78,10 +79,13 @@ jobs:
               except Exception as e:
                   print(f"Telegram upload failed: {e}")
 
+          @app.get("/proxy-health")
+          def health_check():
+              return {"status": "Proxy Online"}
+
           @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
           async def proxy(request: Request, path: str):
               body = await request.body()
-              # Strip authorization headers so Ollama doesn't trigger 401 Unauthorized
               headers = {k: v for k, v in request.headers.items() if k.lower() not in ["host", "authorization"]}
               url = f"{OLLAMA_URL}/{path}"
 
@@ -98,12 +102,15 @@ jobs:
 
                       def stream_processor():
                           full_response = ""
+                          buffer = ""
                           for chunk in res.iter_content(chunk_size=1024):
                               if chunk:
                                   yield chunk
                                   try:
-                                      lines = chunk.decode("utf-8", errors="ignore").strip().split("\n")
-                                      for line in lines:
+                                      buffer += chunk.decode("utf-8", errors="ignore")
+                                      while "\n" in buffer:
+                                          line, buffer = buffer.split("\n", 1)
+                                          line = line.strip()
                                           if line:
                                               data = json.loads(line)
                                               if "message" in data:
@@ -127,19 +134,27 @@ jobs:
               return Response(content=res.content, status_code=res.status_code, headers=dict(res.headers))
           EOF
 
-          # 2. DEFINE DATABASE AUTO-SAVE PROCEDURES
+          # 2. DEFINE DATABASE AUTO-SAVE PROCEDURES (WITH LOCKS & TAR FOR WAL)
           save_memory() {
-            echo "💾 Saving database memory..."
-            docker run --rm -v open-webui-data:/app/backend/data -v $(pwd):/backup ubuntu cp /app/backend/data/webui.db /backup/webui.db 2>/dev/null || true
-            if [ -f "webui.db" ]; then
-              rm -f webui.db.gpg
-              gpg --quiet --batch --yes --symmetric --passphrase="${DB_PASSWORD}" --output webui.db.gpg webui.db
-              git fetch origin memory || git checkout -b memory
-              git checkout memory
-              git add webui.db.gpg
-              git commit -m "Auto-save memory on shutdown [$(date '+%Y-%m-%d %H:%M:%S')]" || true
-              git push origin memory || echo "Warning: Could not push memory backup."
-              git checkout main || true
+            if mkdir /tmp/db_backup.lock 2>/dev/null; then
+              echo "💾 Saving database memory..."
+              docker run --rm -v open-webui-data:/app/backend/data -v $(pwd):/backup ubuntu bash -c "cp /app/backend/data/webui.db* /backup/ 2>/dev/null || true"
+              
+              if [ -f "webui.db" ]; then
+                tar -czf webui_db.tar.gz webui.db*
+                rm -f webui.db.gpg
+                gpg --quiet --batch --yes --symmetric --passphrase="${DB_PASSWORD}" --output webui.db.gpg webui_db.tar.gz
+                
+                git fetch origin memory || git checkout -b memory
+                git checkout memory
+                git add webui.db.gpg
+                git commit -m "Auto-save memory [$(date '+%Y-%m-%d %H:%M:%S')]" || true
+                git push origin memory || echo "Warning: Could not push memory backup."
+                git checkout main || true
+              fi
+              rm -rf /tmp/db_backup.lock
+            else
+              echo "Backup already in progress by another thread."
             fi
           }
 
@@ -185,14 +200,14 @@ jobs:
 
           # 4. START PROXY SERVER
           uvicorn logger_proxy:app --host 0.0.0.0 --port 11435 &
-          until curl -s http://127.0.0.1:11435/api/version > /dev/null; do sleep 1; done
+          until curl -s http://127.0.0.1:11435/proxy-health > /dev/null; do sleep 1; done
           echo "✅ Logger Proxy active on port 11435."
 
           # 5. RESTORE DATABASE VOLUME
           docker volume create open-webui-data
           if [ -f "webui.db" ]; then
             echo "Restoring database file into Docker volume..."
-            docker run --rm -v open-webui-data:/app/backend/data -v $(pwd):/backup ubuntu cp /backup/webui.db /app/backend/data/webui.db
+            docker run --rm -v open-webui-data:/app/backend/data -v $(pwd):/backup ubuntu bash -c "cp /backup/webui.db* /app/backend/data/"
           fi
 
           EXPIRE_AT=$(($(date +%s) + 19200))
@@ -213,7 +228,8 @@ jobs:
 
           until curl -s -f http://127.0.0.1:8080 > /dev/null; do sleep 3; done
 
-          docker exec open-webui bash -c "echo '<script>(function(){const target=${EXPIRE_AT}*1000;const b=document.createElement(\"div\");b.style.cssText=\"position:fixed;top:12px;right:80px;z-index:999999;background:rgba(30,30,30,0.75);color:#e5e7eb;backdrop-filter:blur(8px);padding:4px 12px;border-radius:9999px;font-size:11px;font-weight:600;font-family:monospace;border:1px solid rgba(255,255,255,0.15);pointer-events:none;\";document.body.appendChild(b);function u(){const r=Math.max(0,Math.floor((target-Date.now())/1000));const h=Math.floor(r/3600);const m=Math.floor((r%3600)/60);const s=r%60;b.textContent=\"Time: \"+h+\"h \"+String(m).padStart(2,\"0\")+\"m \"+String(s).padStart(2,\"0\")+\"s\";if(r<=600){b.style.color=\"#f87171\";}}u();setInterval(u,1000);})();</script>' >> /app/build/index.html"
+          # Properly inject script before closing body tag
+          docker exec open-webui bash -c "sed -i 's|</body>|<script>(function(){const target=${EXPIRE_AT}*1000;const b=document.createElement(\"div\");b.style.cssText=\"position:fixed;top:12px;right:80px;z-index:999999;background:rgba(30,30,30,0.75);color:#e5e7eb;backdrop-filter:blur(8px);padding:4px 12px;border-radius:9999px;font-size:11px;font-weight:600;font-family:monospace;border:1px solid rgba(255,255,255,0.15);pointer-events:none;\";document.body.appendChild(b);function u(){const r=Math.max(0,Math.floor((target-Date.now())/1000));const h=Math.floor(r/3600);const m=Math.floor((r%3600)/60);const s=r%60;b.textContent=\"Time: \"+h+\"h \"+String(m).padStart(2,\"0\")+\"m \"+String(s).padStart(2,\"0\")+\"s\";if(r<=600){b.style.color=\"#f87171\";}}u();setInterval(u,1000);})();</script></body>|g' /app/build/index.html"
 
           # 7. EXPOSE VIA NGROK
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
@@ -247,16 +263,7 @@ jobs:
                 -d "chat_id=${TELEGRAM_CHAT_ID}" \
                 -d "text=$METRICS"
 
-              docker run --rm -v open-webui-data:/app/backend/data -v $(pwd):/backup ubuntu cp /app/backend/data/webui.db /backup/webui.db 2>/dev/null || true
-              rm -f webui.db.gpg
-              gpg --quiet --batch --yes --symmetric --passphrase="${DB_PASSWORD}" --output webui.db.gpg webui.db
-              
-              git fetch origin memory || git checkout -b memory
-              git checkout memory
-              if git add webui.db.gpg && git commit -m "Sync Memory DB"; then
-                git push origin memory || echo "Push conflict, retrying next loop"
-              fi
-              git checkout main || true
+              save_memory
             done
           ) &
 
