@@ -17,7 +17,7 @@ jobs:
 
       - name: "Notification: Startup"
         run: |
-          MSG="🚀 AI Workspace Starting (Optimized Mode with Telegram Logging)..."
+          MSG="🚀 AI Workspace Starting..."
           curl -d "$MSG" "ntfy.sh/${{ secrets.NTFY_TOPIC }}"
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" -d "text=$MSG"
 
@@ -52,10 +52,10 @@ jobs:
           # --- RESOURCE OPTIMIZATION ---
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           
-          # --- OLLAMA INSTALL & OPTIMIZATION ---
+          # --- OLLAMA INSTALL & STARTUP ---
           curl -fsSL https://ollama.com/install.sh | sh
           
-          export OLLAMA_HOST=0.0.0.0
+          export OLLAMA_HOST=0.0.0.0:11434
           export OLLAMA_NUM_PARALLEL=1
           export OLLAMA_MAX_LOADED_MODELS=1
           export OLLAMA_KEEP_ALIVE=-1
@@ -67,26 +67,11 @@ jobs:
           
           MODEL="qwen2.5:7b-instruct-q4_K_M"
           ollama pull $MODEL
-          if ! ollama list | grep -q "qwen2.5"; then
-            echo "Model pull failed!"
-            exit 1
-          fi
-
-          # --- TELEGRAM LOGGING PROXY SETUP ---
-          pip install fastapi uvicorn requests
-
-          export TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}"
-          export TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}"
-          python3 logger_proxy.py &
-
-          echo "Waiting for proxy startup..."
-          until curl -s http://127.0.0.1:11435/api/tags > /dev/null; do sleep 2; done
 
           # --- OPEN WEBUI SETUP ---
-          docker run -d -p 8080:8080 \
-            -e OLLAMA_BASE_URL=http://host.docker.internal:11435 \
+          docker run -d --net=host \
+            -e OLLAMA_BASE_URL=http://127.0.0.1:11434 \
             -e WEBUI_SECRET_KEY="${{ secrets.WEBUI_SECRET_KEY }}" \
-            --add-host=host.docker.internal:host-gateway \
             --name open-webui \
             --restart unless-stopped \
             ghcr.io/open-webui/open-webui:main
@@ -102,22 +87,13 @@ jobs:
           sudo apt update && sudo apt install ngrok -y
           ngrok config add-authtoken "${{ secrets.NGROK_TOKEN }}"
           DOMAIN=$(echo "${{ secrets.NGROK_DOMAIN }}" | sed 's|https://||g' | sed 's|http://||g')
-          ngrok http --url=$DOMAIN 127.0.0.1:8080 &
+          ngrok http --url=$DOMAIN 8080 &
 
           # --- READINESS CHECKS ---
-          echo "Verifying Ngrok tunnel..."
-          until curl -s https://$DOMAIN > /dev/null; do sleep 5; done
-          
           echo "Verifying Open WebUI health..."
           until curl -s -f http://127.0.0.1:8080 > /dev/null; do sleep 5; done
-
-          echo "Running inference warm-up..."
-          TEST_START=$(date +%s%3N)
-          ollama run $MODEL "hi" > /dev/null
-          TEST_END=$(date +%s%3N)
-          WARMUP_DUR=$((TEST_END - TEST_START))
           
-          READY_MSG="✅ AI Portal ONLINE: https://$DOMAIN (Warmup: ${WARMUP_DUR}ms)"
+          READY_MSG="✅ AI Portal ONLINE: https://$DOMAIN"
           curl -d "$READY_MSG" "ntfy.sh/${{ secrets.NTFY_TOPIC }}"
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" -d "text=$READY_MSG"
 
@@ -167,3 +143,4 @@ jobs:
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${{ github.repository }}/dispatches" \
             -d '{"event_type": "restart-bot"}'
+            
