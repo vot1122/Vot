@@ -26,6 +26,8 @@ async def proxy(request: Request, path: str):
     body = await request.body()
     headers = dict(request.headers)
     headers.pop("host", None)
+    headers.pop("authorization", None)  # Strips token so Ollama doesn't throw 401
+    
     url = f"{OLLAMA_URL}/{path}"
 
     if path in ["api/chat", "api/generate"] and request.method == "POST":
