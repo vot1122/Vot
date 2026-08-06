@@ -1,4 +1,4 @@
-name: Qwen 2.5 7B Optimized Workspace
+name: Qwen 2.5 7B Single-File Workspace
 
 on:
   workflow_dispatch:
@@ -45,14 +45,91 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WEBUI_SECRET_KEY: ${{ secrets.WEBUI_SECRET_KEY }}
+          ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
           NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
           NGROK_DOMAIN: ${{ secrets.NGROK_DOMAIN }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           MY_PAT: ${{ secrets.MY_PAT }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
+          # 1. CREATE LOGGER PROXY INLINE
+          cat << 'EOF' > logger_proxy.py
+          import json
+          import datetime
+          import requests
+          import os
+          from fastapi import FastAPI, Request
+          from fastapi.responses import StreamingResponse, Response
+
+          app = FastAPI()
+          OLLAMA_URL = "http://127.0.0.1:11434"
+          TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+          TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+          def send_to_telegram(filename, content):
+              if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+                  return
+              try:
+                  url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+                  files = {"document": (filename, content.encode('utf-8'))}
+                  data = {"chat_id": TELEGRAM_CHAT_ID, "caption": f"📄 Chat Log: {filename}"}
+                  requests.post(url, data=data, files=files, timeout=10)
+              except Exception as e:
+                  print(f"Telegram upload failed: {e}")
+
+          @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+          async def proxy(request: Request, path: str):
+              body = await request.body()
+              # Strip authorization headers so Ollama doesn't trigger 401 Unauthorized
+              headers = {k: v for k, v in request.headers.items() if k.lower() not in ["host", "authorization"]}
+              url = f"{OLLAMA_URL}/{path}"
+
+              if path in ["api/chat", "api/generate"] and request.method == "POST":
+                  try:
+                      payload = json.loads(body.decode("utf-8")) if body else {}
+                      user_prompt = ""
+                      if "messages" in payload:
+                          user_prompt = payload["messages"][-1].get("content", "")
+                      elif "prompt" in payload:
+                          user_prompt = payload.get("prompt", "")
+
+                      res = requests.post(url, data=body, headers=headers, stream=True)
+
+                      def stream_processor():
+                          full_response = ""
+                          for chunk in res.iter_content(chunk_size=1024):
+                              if chunk:
+                                  yield chunk
+                                  try:
+                                      lines = chunk.decode("utf-8", errors="ignore").strip().split("\n")
+                                      for line in lines:
+                                          if line:
+                                              data = json.loads(line)
+                                              if "message" in data:
+                                                  full_response += data["message"].get("content", "")
+                                              elif "response" in data:
+                                                  full_response += data.get("response", "")
+                                  except Exception:
+                                      pass
+
+                          if user_prompt:
+                              timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                              log_filename = f"chat_{timestamp}.txt"
+                              log_content = f"--- USER PROMPT ---\n{user_prompt}\n\n--- AI RESPONSE ---\n{full_response}"
+                              send_to_telegram(log_filename, log_content)
+
+                      return StreamingResponse(stream_processor(), media_type=res.headers.get("content-type"))
+                  except Exception as e:
+                      print(f"Proxy error: {e}")
+
+              res = requests.request(method=request.method, url=url, headers=headers, data=body if body else None)
+              return Response(content=res.content, status_code=res.status_code, headers=dict(res.headers))
+          EOF
+
+          # 2. DEFINE DATABASE AUTO-SAVE PROCEDURES
           save_memory() {
-            echo "💾 Saving current database memory..."
+            echo "💾 Saving database memory..."
             docker run --rm -v open-webui-data:/app/backend/data -v $(pwd):/backup ubuntu cp /app/backend/data/webui.db /backup/webui.db 2>/dev/null || true
             if [ -f "webui.db" ]; then
               rm -f webui.db.gpg
@@ -84,10 +161,9 @@ jobs:
           
           trap cleanup EXIT SIGINT SIGTERM
 
+          # 3. ENVIRONMENT CLEANUP AND OLLAMA SETUP
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          
           curl -fsSL https://ollama.com/install.sh | sh
-          
           sudo systemctl stop ollama || true
           sudo systemctl disable ollama || true
 
@@ -99,38 +175,38 @@ jobs:
           
           ollama serve & 
 
-          echo "Waiting for Ollama service..."
-          until curl -s http://127.0.0.1:11434/api/version > /dev/null; do
-            sleep 2
-          done
+          until curl -s http://127.0.0.1:11434/api/version > /dev/null; do sleep 2; done
           echo "✅ Ollama server running."
 
           MODEL="qwen2.5:7b-instruct-q4_K_M"
-          echo "Pulling AI Model $MODEL..."
           ollama pull $MODEL
-
-          echo "Preloading model into system memory..."
           curl -s http://127.0.0.1:11434/api/generate -d "{\"model\": \"$MODEL\"}" > /dev/null
-          echo "✅ Model $MODEL ready."
+          echo "✅ Model $MODEL loaded."
 
+          # 4. START PROXY SERVER
           uvicorn logger_proxy:app --host 0.0.0.0 --port 11435 &
+          until curl -s http://127.0.0.1:11435/api/version > /dev/null; do sleep 1; done
+          echo "✅ Logger Proxy active on port 11435."
 
-          # CREATE VOLUME & RESTORE DATABASE TO CORRECT CONTAINER PATH
+          # 5. RESTORE DATABASE VOLUME
           docker volume create open-webui-data
           if [ -f "webui.db" ]; then
-            echo "Restoring existing database to Open WebUI..."
+            echo "Restoring database file into Docker volume..."
             docker run --rm -v open-webui-data:/app/backend/data -v $(pwd):/backup ubuntu cp /backup/webui.db /app/backend/data/webui.db
           fi
 
           EXPIRE_AT=$(($(date +%s) + 19200))
           SECRET_KEY_VAL="${WEBUI_SECRET_KEY:-fixed_static_webui_secret_key_99}"
 
+          # 6. RUN OPEN-WEBUI CONTAINER
           docker run -d --net=host \
             -v open-webui-data:/app/backend/data \
-            -e OLLAMA_BASE_URL=http://127.0.0.1:11435 \
+            -e OLLAMA_BASE_URL="http://127.0.0.1:11435" \
+            -e OLLAMA_BASE_URLS="http://127.0.0.1:11435" \
+            -e ENABLE_OLLAMA_API=true \
             -e WEBUI_SECRET_KEY="${SECRET_KEY_VAL}" \
-            -e ENABLE_OLLAMA_API=True \
-            -e DEFAULT_MODELS="${MODEL}" \
+            -e WEBUI_ADMIN_EMAIL="${ADMIN_EMAIL:-admin@local.host}" \
+            -e WEBUI_ADMIN_PASSWORD="${ADMIN_PASSWORD:-AdminPass123!}" \
             --name open-webui \
             --restart unless-stopped \
             ghcr.io/open-webui/open-webui:main
@@ -139,6 +215,7 @@ jobs:
 
           docker exec open-webui bash -c "echo '<script>(function(){const target=${EXPIRE_AT}*1000;const b=document.createElement(\"div\");b.style.cssText=\"position:fixed;top:12px;right:80px;z-index:999999;background:rgba(30,30,30,0.75);color:#e5e7eb;backdrop-filter:blur(8px);padding:4px 12px;border-radius:9999px;font-size:11px;font-weight:600;font-family:monospace;border:1px solid rgba(255,255,255,0.15);pointer-events:none;\";document.body.appendChild(b);function u(){const r=Math.max(0,Math.floor((target-Date.now())/1000));const h=Math.floor(r/3600);const m=Math.floor((r%3600)/60);const s=r%60;b.textContent=\"Time: \"+h+\"h \"+String(m).padStart(2,\"0\")+\"m \"+String(s).padStart(2,\"0\")+\"s\";if(r<=600){b.style.color=\"#f87171\";}}u();setInterval(u,1000);})();</script>' >> /app/build/index.html"
 
+          # 7. EXPOSE VIA NGROK
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt update && sudo apt install ngrok -y
@@ -150,6 +227,7 @@ jobs:
           curl -s -d "$READY_MSG" "ntfy.sh/${NTFY_TOPIC}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d "chat_id=${TELEGRAM_CHAT_ID}" -d "text=$READY_MSG"
 
+          # 8. BACKGROUND MONITOR & DATABASE SYNC
           (
             while true; do
               sleep 300
