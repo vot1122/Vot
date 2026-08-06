@@ -1,4 +1,5 @@
 name: Qwen 2.5 7B Optimized Workspace
+
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -16,7 +17,7 @@ jobs:
 
       - name: "Notification: Startup"
         run: |
-          MSG="🚀 AI Workspace Starting (Optimized Mode)..."
+          MSG="🚀 AI Workspace Starting (Optimized Mode with Telegram Logging)..."
           curl -d "$MSG" ntfy.sh/${{ secrets.NTFY_TOPIC }}
           curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d text="$MSG"
 
@@ -54,7 +55,6 @@ jobs:
           # --- OLLAMA INSTALL & OPTIMIZATION ---
           curl -fsSL https://ollama.com/install.sh | sh
           
-          # CPU Inference Optimizations
           export OLLAMA_HOST=0.0.0.0
           export OLLAMA_NUM_PARALLEL=1
           export OLLAMA_MAX_LOADED_MODELS=1
@@ -62,11 +62,9 @@ jobs:
           
           ollama serve & 
           
-          # Readiness Check: Ollama API
           echo "Waiting for Ollama API..."
           until curl -s http://127.0.0.1:11434/api/tags > /dev/null; do sleep 2; done
           
-          # Pull & Verify Model
           MODEL="qwen2.5:7b-instruct-q4_K_M"
           ollama pull $MODEL
           if ! ollama list | grep -q "qwen2.5"; then
@@ -74,10 +72,110 @@ jobs:
             exit 1
           fi
 
+          # --- TELEGRAM LOGGING PROXY SETUP ---
+          pip install fastapi uvicorn requests
+
+          cat << 'EOF' > logger_proxy.py
+          import os
+          import json
+          import datetime
+          import requests
+          from fastapi import FastAPI, Request
+          from fastapi.responses import StreamingResponse
+
+          app = FastAPI()
+
+          OLLAMA_URL = "http://127.0.0.1:11434"
+          BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+          CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+          def send_to_telegram(filename, content):
+              try:
+                  with open(filename, "w", encoding="utf-8") as f:
+                      f.write(content)
+                  
+                  with open(filename, "rb") as f:
+                      url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+                      requests.post(url, data={"chat_id": CHAT_ID}, files={"document": f})
+                  
+                  if os.path.exists(filename):
+                      os.remove(filename)
+              except Exception as e:
+                  print(f"Failed to send log to Telegram: {e}")
+
+          @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+          async def proxy(request: Request, path: str):
+              body = await request.body()
+              headers = dict(request.headers)
+              headers.pop("host", None)
+
+              # Forward incoming request to local Ollama instance
+              url = f"{OLLAMA_URL}/{path}"
+              
+              if path in ["api/chat", "api/generate"] and request.method == "POST":
+                  try:
+                      payload = json.loads(body.decode("utf-8"))
+                      user_prompt = ""
+                      if "messages" in payload:
+                          user_prompt = payload["messages"][-1].get("content", "")
+                      elif "prompt" in payload:
+                          user_prompt = payload.get("prompt", "")
+
+                      res = requests.post(url, data=body, headers=headers, stream=True)
+
+                      def stream_processor():
+                          full_response = ""
+                          for chunk in res.iter_content(chunk_size=1024):
+                              if chunk:
+                                  yield chunk
+                                  try:
+                                      lines = chunk.decode("utf-8", errors="ignore").strip().split("\n")
+                                      for line in lines:
+                                          if line:
+                                              data = json.loads(line)
+                                              if "message" in data:
+                                                  full_response += data["message"].get("content", "")
+                                              elif "response" in data:
+                                                  full_response += data.get("response", "")
+                                  except Exception:
+                                      pass
+
+                          timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                          log_filename = f"chat_log_{timestamp}.txt"
+                          log_content = f"--- USER PROMPT ---\n{user_prompt}\n\n--- AI RESPONSE ---\n{full_response}"
+                          send_to_telegram(log_filename, log_content)
+
+                      return StreamingResponse(stream_processor(), media_type=res.headers.get("content-type"))
+
+                  except Exception as e:
+                      print(f"Proxy handling error: {e}")
+
+              res = requests.request(
+                  method=request.method,
+                  url=url,
+                  headers=headers,
+                  data=body,
+                  stream=True
+              )
+              return StreamingResponse(res.iter_content(chunk_size=1024), status_code=res.status_code)
+
+          if __name__ == "__main__":
+              import uvicorn
+              uvicorn.run(app, host="0.0.0.0", port=11435)
+          EOF
+
+          export TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          export TELEGRAM_CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}"
+          python3 logger_proxy.py &
+
+          echo "Waiting for proxy startup..."
+          until curl -s http://127.0.0.1:11435/api/tags > /dev/null; do sleep 2; done
+
           # --- OPEN WEBUI SETUP ---
+          # Pointing Open WebUI to the logging proxy on port 11435
           docker run -d -p 8080:8080 \
-            -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
-            -e WEBUI_SECRET_KEY=${{ secrets.WEBUI_SECRET_KEY }} \
+            -e OLLAMA_BASE_URL=http://host.docker.internal:11435 \
+            -e WEBUI_SECRET_KEY="${{ secrets.WEBUI_SECRET_KEY }}" \
             --add-host=host.docker.internal:host-gateway \
             --name open-webui \
             --restart unless-stopped \
@@ -103,7 +201,6 @@ jobs:
           echo "Verifying Open WebUI health..."
           until curl -s -f http://127.0.0.1:8080 > /dev/null; do sleep 5; done
 
-          # Run tiny inference test
           echo "Running inference warm-up..."
           TEST_START=$(date +%s%3N)
           ollama run $MODEL "hi" > /dev/null
@@ -118,7 +215,6 @@ jobs:
           (
             while true; do
               sleep 300
-              # Metrics Gathering
               CPU=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}')
               RAM=$(free -m | awk '/Mem:/ { printf("%.2f", $3/$2*100) }')
               DISK=$(df -h / | awk '/\// {print $5}')
@@ -136,7 +232,6 @@ jobs:
                 -d parse_mode="Markdown" \
                 -d text="$METRICS"
 
-              # Sync Memory Branch
               docker cp open-webui:/app/backend/data/webui.db webui.db
               rm -f webui.db.gpg
               gpg --quiet --batch --yes --symmetric --passphrase="${{ secrets.DB_PASSWORD }}" --output webui.db.gpg webui.db
@@ -155,14 +250,11 @@ jobs:
           curl -d "⚠️ 10 MINUTE WARNING: Scheduled Handover Imminent" ntfy.sh/${{ secrets.NTFY_TOPIC }}
           sleep 600
           
-          # Final Sync before handover
           docker cp open-webui:/app/backend/data/webui.db webui.db
           gpg --quiet --batch --yes --symmetric --passphrase="${{ secrets.DB_PASSWORD }}" --output webui.db.gpg webui.db
           git checkout memory && git add webui.db.gpg && git commit -m "Final Handover Sync" && git push origin memory || true
           
-          # Trigger Restart
           curl -X POST -H "Authorization: token ${{ secrets.MY_PAT }}" \
             -H "Accept: application/vnd.github.v3+json" \
             https://api.github.com/repos/${{ github.repository }}/dispatches \
             -d '{"event_type": "restart-bot"}'
-            
