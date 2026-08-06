@@ -1,4 +1,4 @@
-name: Qwen 7B Zero-Conflict Workspace
+name: Qwen 2.5 7B Optimized Workspace
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -16,7 +16,7 @@ jobs:
 
       - name: "Notification: Startup"
         run: |
-          MSG="🚀 AI Workspace Starting (Zero-Conflict Mode)..."
+          MSG="🚀 AI Workspace Starting (Optimized Mode)..."
           curl -d "$MSG" ntfy.sh/${{ secrets.NTFY_TOPIC }}
           curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d text="$MSG"
 
@@ -33,6 +33,7 @@ jobs:
 
       - name: Launch AI Engine & 7B Model
         run: |
+          # --- FUNCTIONS & TRAPS ---
           cleanup() {
             EXIT_CODE=$?
             if [ $EXIT_CODE -eq 0 ]; then REASON="✅ Scheduled Handover Complete.";
@@ -47,27 +48,47 @@ jobs:
           }
           trap cleanup EXIT
 
+          # --- RESOURCE OPTIMIZATION ---
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          
+          # --- OLLAMA INSTALL & OPTIMIZATION ---
           curl -fsSL https://ollama.com/install.sh | sh
+          
+          # CPU Inference Optimizations
           export OLLAMA_HOST=0.0.0.0
+          export OLLAMA_NUM_PARALLEL=1
+          export OLLAMA_MAX_LOADED_MODELS=1
+          export OLLAMA_KEEP_ALIVE=-1
+          
           ollama serve & 
-          sleep 10
-          ollama pull qwen2.5:7b-instruct-q4_K_M
+          
+          # Readiness Check: Ollama API
+          echo "Waiting for Ollama API..."
+          until curl -s http://127.0.0.1:11434/api/tags > /dev/null; do sleep 2; done
+          
+          # Pull & Verify Model
+          MODEL="qwen2.5:7b-instruct-q4_K_M"
+          ollama pull $MODEL
+          if ! ollama list | grep -q "qwen2.5"; then
+            echo "Model pull failed!"
+            exit 1
+          fi
 
-          # Start Web Portal (No volume mount to avoid 0-byte crash)
+          # --- OPEN WEBUI SETUP ---
           docker run -d -p 8080:8080 \
             -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
             -e WEBUI_SECRET_KEY=${{ secrets.WEBUI_SECRET_KEY }} \
             --add-host=host.docker.internal:host-gateway \
-            --name open-webui ghcr.io/open-webui/open-webui:main
+            --name open-webui \
+            --restart unless-stopped \
+            ghcr.io/open-webui/open-webui:main
           
-          # Restore database if it exists
           if [ -f "webui.db" ]; then
             docker cp webui.db open-webui:/app/backend/data/webui.db
             docker restart open-webui
           fi
 
-          # Start Ngrok
+          # --- NGROK SETUP ---
           curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt update && sudo apt install ngrok -y
@@ -75,60 +96,73 @@ jobs:
           DOMAIN=$(echo "${{ secrets.NGROK_DOMAIN }}" | sed 's|https://||g' | sed 's|http://||g')
           ngrok http --url=$DOMAIN 127.0.0.1:8080 &
 
-          # LIVE HEALTH MONITOR
-          (
-            while true; do
-              sleep 60
-              if ! docker ps | grep -q open-webui; then
-                echo "Container died! Triggering cleanup."
-                exit 1
-              fi
-              if docker logs open-webui 2>&1 | grep -q "Fetching"; then
-                P=$(docker logs open-webui 2>&1 | grep "Fetching" | tail -n 1)
-                curl -d "⏳ Initializing: $P" ntfy.sh/${{ secrets.NTFY_TOPIC }}
-              fi
-            done
-          ) &
+          # --- READINESS CHECKS ---
+          echo "Verifying Ngrok tunnel..."
+          until curl -s https://$DOMAIN > /dev/null; do sleep 5; done
+          
+          echo "Verifying Open WebUI health..."
+          until curl -s -f http://127.0.0.1:8080 > /dev/null; do sleep 5; done
 
-          echo "Waiting for stabilization..."
-          sleep 600
+          # Run tiny inference test
+          echo "Running inference warm-up..."
+          TEST_START=$(date +%s%3N)
+          ollama run $MODEL "hi" > /dev/null
+          TEST_END=$(date +%s%3N)
+          WARMUP_DUR=$((TEST_END - TEST_START))
           
-          docker exec open-webui bash -c "echo '<script>setInterval(function(){let r=Math.max(0,19200000-(new Date().getTime()-(window.s||(window.s=new Date().getTime())))),m=Math.floor(r/60000),s=Math.floor(r%60000/1000),d=document.getElementById(\"rt\");d||((d=document.createElement(\"div\")).id=\"rt\",d.style=\"position:fixed;top:10px;right:10px;z-index:9999;padding:8px;background:rgba(0,0,0,0.8);color:white;border-radius:4px;font:12px monospace;\",document.body.appendChild(d)),d.innerHTML=\"RESTART: \"+m+\"m \"+s+\"s\",m<10&&(d.style.background=\"red\")},1000)</script>' >> /app/build/index.html" || echo "Timer skipped"
-          
-          until curl -s -f http://127.0.0.1:8080 > /dev/null; do sleep 10; done
-          READY_MSG="✅ AI Portal ONLINE: https://$DOMAIN"
+          READY_MSG="✅ AI Portal ONLINE: https://$DOMAIN (Warmup: ${WARMUP_DUR}ms)"
           curl -d "$READY_MSG" ntfy.sh/${{ secrets.NTFY_TOPIC }}
           curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d text="$READY_MSG"
 
-          # ACTIVITY MONITOR & SYNC
+          # --- BACKGROUND MONITORING & SYNC ---
           (
             while true; do
               sleep 300
+              # Metrics Gathering
+              CPU=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}')
+              RAM=$(free -m | awk '/Mem:/ { printf("%.2f", $3/$2*100) }')
+              DISK=$(df -h / | awk '/\// {print $5}')
+              OLLAMA_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:11434/api/tags)
+              
+              METRICS="📊 *Health Report*
+🖥 CPU: $CPU%
+🧠 RAM: $RAM%
+💾 Disk: $DISK
+🤖 Ollama: $OLLAMA_STATUS
+🌐 WebUI: Healthy"
+
+              curl -s -X POST https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage \
+                -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
+                -d parse_mode="Markdown" \
+                -d text="$METRICS"
+
+              # Sync Memory Branch
               docker cp open-webui:/app/backend/data/webui.db webui.db
               rm -f webui.db.gpg
               gpg --quiet --batch --yes --symmetric --passphrase="${{ secrets.DB_PASSWORD }}" --output webui.db.gpg webui.db
-              git checkout memory && git add webui.db.gpg && git commit -m "Sync" && git push origin memory || echo "No change"
+              
+              git fetch origin memory
+              git checkout memory
+              if git add webui.db.gpg && git commit -m "Sync: $(date +'%Y-%m-%d %H:%M:%S')"; then
+                git push origin memory || echo "Push conflict, retrying next loop"
+              fi
               git checkout main
             done
           ) &
 
-          sleep 18600
-          curl -d "⚠️ 10 MINUTE WARNING!" ntfy.sh/${{ secrets.NTFY_TOPIC }}
+          # --- HANDOVER LOGIC ---
+          sleep 18600 # 5h 10m
+          curl -d "⚠️ 10 MINUTE WARNING: Scheduled Handover Imminent" ntfy.sh/${{ secrets.NTFY_TOPIC }}
           sleep 600
-          curl -X POST -H "Authorization: token ${{ secrets.MY_PAT }}" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/${{ github.repository }}/dispatches -d '{"event_type": "restart-bot"}'
-              git checkout main
-            done
-          ) &
-
-          sleep 18600
-          curl -d "⚠️ 10 MINUTE WARNING!" ntfy.sh/${{ secrets.NTFY_TOPIC }}
-          sleep 600
-          curl -X POST -H "Authorization: token ${{ secrets.MY_PAT }}" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/${{ github.repository }}/dispatches -d '{"event_type": "restart-bot"}'
-              git checkout main
-            done
-          ) &
-
-          sleep 18600
-          curl -d "⚠️ 10 MINUTE WARNING!" ntfy.sh/${{ secrets.NTFY_TOPIC }}
-          sleep 600
-          curl -X POST -H "Authorization: token ${{ secrets.MY_PAT }}" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/${{ github.repository }}/dispatches -d '{"event_type": "restart-bot"}'
+          
+          # Final Sync before handover
+          docker cp open-webui:/app/backend/data/webui.db webui.db
+          gpg --quiet --batch --yes --symmetric --passphrase="${{ secrets.DB_PASSWORD }}" --output webui.db.gpg webui.db
+          git checkout memory && git add webui.db.gpg && git commit -m "Final Handover Sync" && git push origin memory || true
+          
+          # Trigger Restart
+          curl -X POST -H "Authorization: token ${{ secrets.MY_PAT }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type": "restart-bot"}'
+            
