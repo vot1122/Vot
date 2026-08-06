@@ -69,8 +69,6 @@ jobs:
           cleanup() {
             EXIT_CODE=$?
             echo "Handling exit signal (Code: $EXIT_CODE)..."
-            
-            # Persist database state regardless of why the workflow ended
             save_memory
 
             if [ $EXIT_CODE -eq 0 ]; then REASON="✅ Scheduled Handover Complete.";
@@ -84,7 +82,6 @@ jobs:
             curl -s -d "$REASON" "ntfy.sh/${NTFY_TOPIC}"
           }
           
-          # TRAP SIGINT, SIGTERM, and EXIT signals
           trap cleanup EXIT SIGINT SIGTERM
 
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
@@ -94,36 +91,29 @@ jobs:
           sudo systemctl stop ollama || true
           sudo systemctl disable ollama || true
 
+          # SPEED OPTIMIZATION ENVIRONMENT VARIABLES
           export OLLAMA_HOST=0.0.0.0:11434
           export OLLAMA_NUM_PARALLEL=1
           export OLLAMA_MAX_LOADED_MODELS=1
           export OLLAMA_KEEP_ALIVE=-1
+          export OLLAMA_FLASH_ATTENTION=1
           
           ollama serve & 
 
-          echo "Waiting for Ollama service to start..."
+          echo "Waiting for Ollama service..."
           until curl -s http://127.0.0.1:11434/api/version > /dev/null; do
             sleep 2
           done
-          echo "✅ Ollama server is up and listening."
-
-          echo "Starting pre-launch 1-minute system monitoring..."
-          (
-            while true; do
-              if curl -s -f http://127.0.0.1:8080 > /dev/null; then
-                break
-              fi
-              CPU=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}')
-              RAM=$(free -m | awk '/Mem:/ { printf("%.2f", $3/$2*100) }')
-              echo "[STARTUP MONITOR - $(date '+%H:%M:%S')] CPU: ${CPU}% | RAM: ${RAM}% | Waiting for WebUI..."
-              sleep 60
-            done
-          ) &
+          echo "✅ Ollama server running."
 
           MODEL="qwen2.5:7b-instruct-q4_K_M"
-          echo "Initiating model download for $MODEL..."
-          ollama pull $MODEL | while read -r line; do echo "[OLLAMA PULL] $line"; done
-          echo "✅ Model $MODEL downloaded successfully."
+          echo "Pulling AI Model $MODEL..."
+          ollama pull $MODEL
+
+          # Preload model into RAM immediately so first token response is fast
+          echo "Preloading model into system memory..."
+          curl -s http://127.0.0.1:11434/api/generate -d "{\"model\": \"$MODEL\"}" > /dev/null
+          echo "✅ Model $MODEL ready."
 
           uvicorn logger_proxy:app --host 0.0.0.0 --port 11435 &
 
@@ -133,19 +123,18 @@ jobs:
           fi
 
           EXPIRE_AT=$(($(date +%s) + 19200))
-
-          # Default static key fallback if WEBUI_SECRET_KEY secret is omitted
           SECRET_KEY_VAL="${WEBUI_SECRET_KEY:-fixed_static_webui_secret_key_99}"
 
           docker run -d --net=host \
             -v open-webui-data:/app/backend/data \
             -e OLLAMA_BASE_URL=http://127.0.0.1:11435 \
             -e WEBUI_SECRET_KEY="${SECRET_KEY_VAL}" \
+            -e ENABLE_OLLAMA_API=True \
             --name open-webui \
             --restart unless-stopped \
             ghcr.io/open-webui/open-webui:main
 
-          sleep 8
+          until curl -s -f http://127.0.0.1:8080 > /dev/null; do sleep 3; done
 
           docker exec open-webui bash -c "echo '<script>(function(){const target=${EXPIRE_AT}*1000;const b=document.createElement(\"div\");b.style.cssText=\"position:fixed;top:12px;right:80px;z-index:999999;background:rgba(30,30,30,0.75);color:#e5e7eb;backdrop-filter:blur(8px);padding:4px 12px;border-radius:9999px;font-size:11px;font-weight:600;font-family:monospace;border:1px solid rgba(255,255,255,0.15);pointer-events:none;\";document.body.appendChild(b);function u(){const r=Math.max(0,Math.floor((target-Date.now())/1000));const h=Math.floor(r/3600);const m=Math.floor((r%3600)/60);const s=r%60;b.textContent=\"Time: \"+h+\"h \"+String(m).padStart(2,\"0\")+\"m \"+String(s).padStart(2,\"0\")+\"s\";if(r<=600){b.style.color=\"#f87171\";}}u();setInterval(u,1000);})();</script>' >> /app/build/index.html"
 
@@ -156,13 +145,10 @@ jobs:
           DOMAIN=$(echo "${NGROK_DOMAIN}" | sed 's|https://||g' | sed 's|http://||g')
           ngrok http --url=$DOMAIN 8080 &
 
-          until curl -s -f http://127.0.0.1:8080 > /dev/null; do sleep 5; done
-
           READY_MSG="✅ AI Portal ONLINE: https://$DOMAIN"
           curl -s -d "$READY_MSG" "ntfy.sh/${NTFY_TOPIC}"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d "chat_id=${TELEGRAM_CHAT_ID}" -d "text=$READY_MSG"
 
-          # Periodic background backup (every 5 minutes)
           (
             while true; do
               sleep 300
@@ -199,9 +185,7 @@ jobs:
           curl -s -d "⚠️ 10 MINUTE WARNING: Scheduled Handover Imminent" "ntfy.sh/${NTFY_TOPIC}"
           sleep 600
           
-          # Trigger auto-restart for seamless session rollover
           curl -X POST -H "Authorization: token ${MY_PAT}" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${{ github.repository }}/dispatches" \
             -d '{"event_type": "restart-bot"}'
-            
