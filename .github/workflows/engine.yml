@@ -35,7 +35,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install Python Dependencies
-        run: pip install --no-cache-dir fastapi uvicorn requests sqlite3
+        run: pip install --no-cache-dir fastapi uvicorn requests
 
       - name: Decrypt and Restore Database Memory
         run: |
